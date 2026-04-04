@@ -1,0 +1,9 @@
+Traceback (most recent call last):
+  File "<string>", line 11, in <module>
+    print(pos, hex(ord(ch)), repr(ch))
+    ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python313\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2500' in position 1: character maps to <undefined>
+657 0x2500 

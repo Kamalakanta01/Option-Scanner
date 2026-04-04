@@ -1,0 +1,30 @@
+scanner.py: 10 non-ASCII chars:
+  U+2500 at pos 657
+  U+2014 at pos 3050
+  U+2192 at pos 5586
+  U+25B8 at pos 10743
+  U+00D7 at pos 11303
+  U+2191 at pos 13184
+  U+2193 at pos 13224
+  U+1F6A8 at pos 13249
+  U+1F4A5 at pos 13631
+  U+2026 at pos 14786
+scanner_scrape.py: 9 non-ASCII chars:
+  U+2500 at pos 88
+  U+2022 at pos 309
+  U+00B1 at pos 1901
+  U+2192 at pos 3591
+  U+2014 at pos 14315
+  U+2026 at pos 14579
+  U+2013 at pos 16773
+  U+20B9 at pos 17287
+  U+25B8 at pos 23181
+interactive_login.py: 8 non-ASCII chars:
+  U+2014 at pos 64
+  U+2500 at pos 386
+  U+20B9 at pos 9275
+  U+2550 at pos 15273
+  U+2192 at pos 15549
+  U+25B8 at pos 15967
+  U+2026 at pos 16521
+  U+00D7 at pos 19784

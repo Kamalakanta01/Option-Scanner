@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+*.log
+alerts.json
+groww_state.json
+.DS_Store
+*.swp
