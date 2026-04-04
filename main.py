@@ -900,69 +900,94 @@ class Scanner:
             log.error(f"could not save alerts: {e}")
 
 # ---------------------------------------------------------------------------
-# Main run loop
+# Main run loop - single browser, multiple tabs
 # ---------------------------------------------------------------------------
 async def _run_loop(once: bool) -> None:
     scanner = Scanner()
-    sweep_count = 0
 
     async with async_playwright() as pw:
-        browser: Optional[Browser] = None
+        # Launch browser
+        log.info("launching browser...")
+        browser = await pw.chromium.launch(
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        
+        # Create context with storage
+        vp_w, vp_h = random.choice(_VIEWPORTS)
+        ctx = await browser.new_context(
+            storage_state=str(STORAGE_FILE) if STORAGE_FILE.exists() else None,
+            user_agent=_random_ua(),
+            viewport={"width": vp_w, "height": vp_h},
+            screen={"width": vp_w, "height": vp_h},
+            locale="en-IN",
+            timezone_id="Asia/Kolkata",
+        )
+        
+        # Apply stealth patches
+        await ctx.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+            Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+            Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+            window.chrome = {runtime: {}, loadTimes: {}, csi: {}};
+            Permissions.prototype.query = x => Promise.resolve({state: 'granted'});
+        """)
+        
+        log.info("browser ready")
 
-        async def get_browser() -> Browser:
-            nonlocal browser
-            if browser:
-                with suppress(Exception):
-                    await browser.close()
-            browser = await pw.chromium.launch(
-                headless=False,
-                args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
-            )
-            log.info("browser launched")
-            return browser
+        # Open tabs for each instrument
+        pages = []
+        for inst in INSTRUMENTS:
+            p = await ctx.new_page()
+            await p.goto(inst["url"], wait_until="domcontentloaded", timeout=30_000)
+            await asyncio.sleep(3)
+            pages.append((inst, p))
+            log.info(f"  opened tab: {inst['name']}")
 
-        browser = await get_browser()
-
-        if not STORAGE_FILE.exists():
-            log.info("no session file — starting interactive login")
-            ok = await _interactive_login(browser)
-            if not ok:
-                log.error("login failed — exiting")
-                return
-        else:
-            log.info("session file found — validating...")
-            valid = await _session_valid(browser)
-            if not valid:
-                log.info("session expired — re-logging in")
-                ok = await _interactive_login(browser)
-                if not ok:
-                    log.error("re-login failed — exiting")
-                    return
-
-        await _warmup(browser)
+        log.info(f"{len(pages)} tabs ready")
 
         if not once:
             log.info(f"continuous mode  interval={SCAN_INTERVAL}s")
 
         try:
             while True:
-                sweep_count += 1
-                try:
-                    await scanner.sweep(browser)
-                except Exception as e:
-                    log.error(f"sweep error: {e}")
-                    if "--debug" in sys.argv:
-                        traceback.print_exc()
+                ts = datetime.now().strftime("%H:%M:%S")
+                log.info(f"SWEEP {ts}")
+
+                for inst, page in pages:
+                    name = inst["name"]
+                    log.info(f"> {name}")
+                    
+                    # Reload to get fresh data
+                    await page.reload(wait_until="domcontentloaded", timeout=30_000)
+                    await asyncio.sleep(PAGE_SETTLE)
+                    
+                    try:
+                        await scanner._scan_instrument(page, inst)
+                    except Exception as e:
+                        log.warning(f"  {name}: {e}")
+                        if "--debug" in sys.argv:
+                            traceback.print_exc()
+
+                log.info(f"Summary: watching={len(scanner.watchlist)}, total={len(scanner.alerts)}")
+                scanner._save()
 
                 if once:
                     break
                 await asyncio.sleep(SCAN_INTERVAL)
+
         except KeyboardInterrupt:
             log.info("interrupted by user")
         finally:
-            if browser:
-                with suppress(Exception):
-                    await browser.close()
+            # Save session
+            with suppress(Exception):
+                await ctx.storage_state(path=str(STORAGE_FILE))
+            with suppress(Exception):
+                await ctx.close()
+            with suppress(Exception):
+                await browser.close()
             log.info("done")
 
 # ---------------------------------------------------------------------------
