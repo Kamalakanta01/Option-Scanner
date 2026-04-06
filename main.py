@@ -10,6 +10,9 @@ import random
 import re
 import sys
 import traceback
+import urllib.request
+import urllib.error
+from urllib import parse as urllib_parse
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -17,6 +20,26 @@ from pathlib import Path
 from typing import Optional
 
 from playwright.async_api import async_playwright, BrowserContext, Page
+
+TELEGRAM_BOT_TOKEN = "8003139162:AAHJOyWOzNRuNxhMLaulF6XBcXeXjyAP33g"  # Your bot token from @BotFather
+TELEGRAM_CHAT_ID   = "-4926416519"  # Your chat ID from @userinfobot
+
+def _send_telegram(message: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = urllib_parse.urlencode({
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+    }).encode()
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
 
 STORAGE_FILE  = Path("groww_state.json")
 ALERT_FILE    = Path("alerts.json")
@@ -550,6 +573,8 @@ class Scanner:
     def __init__(self):
         self.alerts:    list[Alert]      = []
         self.watchlist: dict[str, Alert] = {}
+        self._new_alerts_batch: list[Alert] = []
+        self._broken_alerts_batch: list[Alert] = []
 
     def atm_strikes(self, price: float, step: int) -> set[int]:
         atm = round(price / step) * step
@@ -558,6 +583,8 @@ class Scanner:
     async def sweep(self, browser) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
         print(f"\n{'=' * 60}\n  SWEEP  {ts}\n{'=' * 60}")
+        self._new_alerts_batch.clear()
+        self._broken_alerts_batch.clear()
 
         for inst in INSTRUMENTS:
             ctx = page = None
@@ -580,6 +607,7 @@ class Scanner:
         print(f"\n  Summary: watching={len(self.watchlist)}, "
               f"broken={sum(1 for a in self.alerts if a.broken)}, "
               f"total={len(self.alerts)}")
+        self._send_batch_telegram()
         self._save()
 
     async def _scan_instrument(self, page: Page, inst: dict) -> None:
@@ -731,6 +759,7 @@ class Scanner:
         )
         self.alerts.append(alert)
         self.watchlist[key] = alert
+        self._new_alerts_batch.append(alert)
         self._print_alert(alert)
         return 1
 
@@ -740,6 +769,7 @@ class Scanner:
             a.broken    = True
             a.broken_at = datetime.now().isoformat()
             a.ltp       = ltp
+            self._broken_alerts_batch.append(a)
             self._print_breakout(a, ltp)
 
     @staticmethod
@@ -755,6 +785,29 @@ class Scanner:
         side  = "HIGH ^" if a.condition == "Open==High" else "LOW v"
         print(f"  [!] BROKEN {side}  {a.instrument} {a.strike}{a.opt_type}"
               f"  exp={a.expiry}  level={level:.2f}  ltp={ltp:.2f}")
+
+    def _send_batch_telegram(self) -> None:
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            return
+        
+        lines = []
+        if self._new_alerts_batch:
+            lines.append("🔔 <b>NEW ALERTS</b>")
+            for a in self._new_alerts_batch:
+                lines.append(f"{a.instrument} {a.strike}{a.opt_type} | {a.condition}")
+        
+        if self._broken_alerts_batch:
+            if lines:
+                lines.append("")
+            lines.append("💥 <b>BROKEN ALERTS</b>")
+            for a in self._broken_alerts_batch:
+                level = a.high if a.condition == "Open==High" else a.low
+                lines.append(f"{a.instrument} {a.strike}{a.opt_type} | {a.condition} | LTP={a.ltp:.2f}")
+        
+        if lines:
+            ts = datetime.now().strftime("%H:%M")
+            msg = f"📊 <b>Scanner Update {ts}</b>\n\n" + "\n".join(lines)
+            _send_telegram(msg)
 
     def _save(self) -> None:
         payload = {
