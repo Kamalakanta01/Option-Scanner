@@ -1,18 +1,11 @@
 #!/usr/bin/env python3
 """
 Groww Open==High / Open==Low Alert Scanner
-Single entry point — handles login + scanning automatically.
-Designed for 24/7 unattended operation.
-
-Usage:
-    python main.py              # continuous mode
-    python main.py --once       # single sweep and exit
-    python main.py --debug      # verbose XHR + traceback
+Single entry point - handles login + scanning automatically.
 """
 
 import asyncio
 import json
-import logging
 import random
 import re
 import sys
@@ -20,22 +13,18 @@ import traceback
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
-from playwright.async_api import async_playwright, BrowserContext, Page, Browser
+from playwright.async_api import async_playwright, BrowserContext, Page
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 STORAGE_FILE  = Path("groww_state.json")
 ALERT_FILE    = Path("alerts.json")
 LOG_FILE      = Path("scanner.log")
-SCAN_INTERVAL = 90    # seconds between sweeps
-STRIKE_RANGE  = 12    # ATM ± this many strikes
-PAGE_SETTLE   = 6.0   # seconds after domcontentloaded
-EXPIRY_SETTLE = 3.5   # seconds after expiry click
+SCAN_INTERVAL = 90
+STRIKE_RANGE  = 12
+PAGE_SETTLE   = 6.0
+EXPIRY_SETTLE = 3.5
 
 INSTRUMENTS = [
     dict(name="NIFTY",    step=50,  n_expiries=2,
@@ -73,33 +62,6 @@ _INDEX_ALIASES = {
 _CHROME_VERSIONS = ["124.0.0.0", "123.0.0.0", "125.0.0.0", "126.0.0.0", "122.0.0.0"]
 _VIEWPORTS       = [(1920, 1080), (1792, 1120), (1856, 1056), (1680, 1050), (1536, 864)]
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-def _setup_logging() -> logging.Logger:
-    fmt    = logging.Formatter("%(asctime)s  %(levelname)-7s  %(message)s",
-                               datefmt="%Y-%m-%d %H:%M:%S")
-    logger = logging.getLogger("scanner")
-    logger.setLevel(logging.DEBUG)
-
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setLevel(logging.INFO)
-    sh.setFormatter(fmt)
-    logger.addHandler(sh)
-
-    fh = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3,
-                             encoding="utf-8")
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-
-    return logger
-
-log = _setup_logging()
-
-# ---------------------------------------------------------------------------
-# Data model
-# ---------------------------------------------------------------------------
 @dataclass
 class Alert:
     symbol:     str
@@ -112,13 +74,10 @@ class Alert:
     high:       float
     low:        float
     ltp:        Optional[float] = None
-    seen_at:    str  = field(default_factory=lambda: datetime.now().isoformat())
+    seen_at:    str = field(default_factory=lambda: datetime.now().isoformat())
     broken:     bool = False
     broken_at:  Optional[str] = None
 
-# ---------------------------------------------------------------------------
-# Utility
-# ---------------------------------------------------------------------------
 def _sf(v) -> Optional[float]:
     if v is None:
         return None
@@ -136,9 +95,6 @@ def _key_matches_index(key: str, name_upper: str) -> bool:
     ku = key.upper()
     return any(n in ku for n in needles)
 
-# ---------------------------------------------------------------------------
-# Date / symbol parsing
-# ---------------------------------------------------------------------------
 def _code_to_date(code: str) -> Optional[str]:
     if code.isdigit():
         if len(code) == 6:
@@ -212,9 +168,6 @@ def build_symbol_candidates(name: str, expiry: str, strike: int, opt: str) -> li
         f"{name}{year_short}{month_abbr}{s}{opt}",
     ]
 
-# ---------------------------------------------------------------------------
-# Price extraction
-# ---------------------------------------------------------------------------
 def _search_index_price(data, name_upper: str) -> Optional[float]:
     PRICE_FIELDS = ("value", "ltp", "open", "close", "lastPrice")
     if isinstance(data, dict):
@@ -303,9 +256,6 @@ async def scrape_price_from_dom(page: Page) -> Optional[float]:
     except Exception:
         return None
 
-# ---------------------------------------------------------------------------
-# Contract extraction
-# ---------------------------------------------------------------------------
 def extract_contracts(captured: dict, name: str) -> dict:
     result = {}
     for data in captured.values():
@@ -336,32 +286,18 @@ def extract_expiries_from_contracts(contracts: dict, name: str) -> list[str]:
             expiries.add(parsed[1])
     return sorted(expiries)
 
-# ---------------------------------------------------------------------------
-# MCX helpers
-# FIX 1: use page.content() (full HTML incl. <head>) not inner_html("body")
-# FIX 2: re.DOTALL so the regex matches __NEXT_DATA__ across newlines
-# ---------------------------------------------------------------------------
 async def _load_mcx_chain_data(page: Page, url: str) -> Optional[dict]:
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-        await asyncio.sleep(5)                      # extra settle for MCX JS
-
-        # Full page source — __NEXT_DATA__ lives in <head>, not <body>
+        await asyncio.sleep(5)
         html = await page.content()
-
         m = re.search(
             r'<script\s+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
             html,
-            re.DOTALL,                              # FIX: match across newlines
+            re.DOTALL,
         )
         if not m:
-            log.debug(f"MCX: __NEXT_DATA__ not found  (html len={len(html)})")
-            # Dump first 300 chars of <head> to log so we can see what's there
-            head_m = re.search(r'<head[^>]*>(.*?)</head>', html, re.DOTALL | re.IGNORECASE)
-            if head_m:
-                log.debug(f"MCX head snippet: {head_m.group(1)[:300]!r}")
             return None
-
         data       = json.loads(m.group(1))
         chain_root = (data.get("props", {})
                           .get("pageProps", {})
@@ -374,19 +310,14 @@ async def _load_mcx_chain_data(page: Page, url: str) -> Optional[dict]:
         current_expiry = expiry_details.get("currentExpiry") or (
             expiry_details.get("expiryDates", [None])[0]
         )
-
         if not option_chains or not current_expiry:
-            log.debug(f"MCX: parsed OK but chain empty  "
-                      f"chains={len(option_chains)}  expiry={current_expiry!r}")
             return None
-
         return {
             "chains":     option_chains,
             "expiry":     current_expiry,
             "underlying": underlying,
         }
-    except Exception as e:
-        log.debug(f"MCX chain load error: {e}")
+    except Exception:
         return None
 
 def _extract_mcx_chain_prices(chain_data: dict,
@@ -413,9 +344,6 @@ def _extract_mcx_chain_prices(chain_data: dict,
             result[sym] = {"open": o, "high": h, "low": l, "ltp": ltp}
     return result
 
-# ---------------------------------------------------------------------------
-# Anti-detection
-# ---------------------------------------------------------------------------
 def _random_ua() -> str:
     ver = random.choice(_CHROME_VERSIONS)
     return (f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -425,7 +353,7 @@ def _random_ua() -> str:
 async def _human_delay(min_s: float = 0.3, max_s: float = 1.2) -> None:
     await asyncio.sleep(random.uniform(min_s, max_s))
 
-async def _make_context(browser: Browser) -> BrowserContext:
+async def _make_context(browser) -> BrowserContext:
     vp_w, vp_h = random.choice(_VIEWPORTS)
     ua = _random_ua()
     ctx = await browser.new_context(
@@ -452,20 +380,17 @@ async def _make_context(browser: Browser) -> BrowserContext:
             "sec-ch-ua-platform": '"Windows"',
         },
     )
-    await ctx.add_init_script(f"""
-        Object.defineProperty(navigator, 'webdriver', {{get: () => undefined}});
-        Object.defineProperty(navigator, 'plugins', {{get: () => [1,2,3,4,5]}});
-        Object.defineProperty(navigator, 'languages', {{get: () => ['en-US','en']}});
-        Object.defineProperty(navigator, 'hardwareConcurrency', {{get: () => 8}});
-        Object.defineProperty(navigator, 'deviceMemory', {{get: () => 8}});
-        window.chrome = {{runtime: {{}}, loadTimes: {{}}, csi: {{}}}};
-        Permissions.prototype.query = x => Promise.resolve({{state: 'granted'}});
+    await ctx.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+        Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+        Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+        Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+        window.chrome = {runtime: {}, loadTimes: {}, csi: {}};
+        Permissions.prototype.query = x => Promise.resolve({state: 'granted'});
     """)
     return ctx
 
-# ---------------------------------------------------------------------------
-# Browser navigation
-# ---------------------------------------------------------------------------
 async def navigate_and_capture(page: Page, url: str,
                                 settle: float = PAGE_SETTLE) -> dict:
     captured: dict = {}
@@ -480,20 +405,13 @@ async def navigate_and_capture(page: Page, url: str,
     page.on("response", _on_response)
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-        await _human_delay(0.5, 1.5)
-        with suppress(Exception):
-            await page.mouse.wheel(0, random.randint(100, 400))
     except Exception as e:
-        log.debug(f"goto error ({url[:60]}): {e}")
-    await asyncio.sleep(settle + random.uniform(0, 0.8))
+        print(f"    ! goto error: {e}")
+    await asyncio.sleep(settle)
     page.remove_listener("response", _on_response)
     return captured
 
 async def _click_expiry_in_dom(page: Page, expiry_date: str) -> bool:
-    """
-    Try <select> first (dispatches change event), then buttons/tabs/spans.
-    Also checks data-value / data-expiry / data-date attributes.
-    """
     try:
         dt    = datetime.strptime(expiry_date, "%Y-%m-%d")
         human = [
@@ -536,7 +454,6 @@ async def _click_expiry_in_dom(page: Page, expiry_date: str) -> bool:
         }""",
         [expiry_date, human],
     )
-    log.debug(f"expiry click result: {result}")
     return result is not None
 
 async def capture_after_expiry_click(page: Page, expiry_date: str,
@@ -556,33 +473,23 @@ async def capture_after_expiry_click(page: Page, expiry_date: str,
     page.remove_listener("response", _on_response)
     return new_xhr
 
-# ---------------------------------------------------------------------------
-# Session check
-# ---------------------------------------------------------------------------
-async def _session_valid(browser: Browser) -> bool:
-    """Check if current session is valid by attempting to access options page."""
-    ctx = None
-    page = None
+async def _check_session_valid(browser) -> bool:
+    ctx = page = None
     try:
         ctx = await _make_context(browser)
         page = await ctx.new_page()
-        
-        resp = await page.goto("https://groww.in/options/nifty",
-            wait_until="domcontentloaded", timeout=20_000)
+        await page.goto("https://groww.in/options/nifty",
+                        wait_until="domcontentloaded", timeout=20_000)
         await asyncio.sleep(3)
-        
         title = await page.title()
-        cur_url = page.url.lower()
-        
-        # Simple check like backup version
-        if "login" in title.lower() or "sign" in title.lower():
-            log.info(f"session invalid: title={title!r}")
+        url = page.url.lower()
+        if "login" in url or "login" in title.lower() or "sign" in title.lower():
+            print("  session invalid (login page)")
             return False
-        
-        log.debug(f"session check OK: url={cur_url[:50]} title={title[:30]!r}")
+        print(f"  session valid")
         return True
     except Exception as e:
-        log.warning(f"session check error: {e} — assuming expired")
+        print(f"  session check error: {e}")
         return False
     finally:
         with suppress(Exception):
@@ -590,45 +497,19 @@ async def _session_valid(browser: Browser) -> bool:
         with suppress(Exception):
             if ctx: await ctx.close()
 
-# ---------------------------------------------------------------------------
-# Warmup
-# ---------------------------------------------------------------------------
-async def _warmup(browser: Browser) -> None:
-    ctx = None
-    page = None
-    try:
-        log.info("warming up session (loading options/nifty) ...")
-        ctx = await _make_context(browser)
-        page = await ctx.new_page()
-        await page.goto("https://groww.in/options/nifty",
-                        wait_until="domcontentloaded", timeout=30_000)
-        await asyncio.sleep(4)
-        log.info("warmup done")
-    except Exception as e:
-        log.warning(f"warmup failed (non-fatal): {e}")
-    finally:
-        with suppress(Exception):
-            if page: await page.close()
-        with suppress(Exception):
-            if ctx: await ctx.close()
-
-# ---------------------------------------------------------------------------
-# Interactive login
-# ---------------------------------------------------------------------------
-async def _interactive_login(browser: Browser) -> bool:
-    print("\n" + "="*60)
-    print(" GROWW LOGIN REQUIRED")
-    print("="*60)
+async def _interactive_login(browser) -> bool:
+    print("\n" + "=" * 60)
+    print("  LOGIN REQUIRED")
+    print("=" * 60)
     print("""
- A browser will open. Please:
- 1. Login with your email/password
- 2. Enter your PIN when prompted  
- 3. Wait for the page to fully load
- 4. Press ENTER here when done
+  1. Browser will open groww.in
+  2. Login with email/password
+  3. Complete PIN verification if asked
+  4. Wait for page to fully load
+  5. Press ENTER here when done
 """)
 
-    ctx = None
-    page = None
+    ctx = page = None
     try:
         ctx = await browser.new_context(
             viewport={"width": 1920, "height": 1080},
@@ -636,32 +517,28 @@ async def _interactive_login(browser: Browser) -> bool:
             timezone_id="Asia/Kolkata",
         )
         page = await ctx.new_page()
-        
-        await page.goto("https://groww.in/options/nifty",
-            wait_until="domcontentloaded", timeout=30_000)
-        
-        input("\n[Press ENTER after completing login + PIN]... ")
+        await page.goto("https://groww.in/login",
+                        wait_until="domcontentloaded", timeout=30_000)
 
-        title = await page.title()
+        print("  Press ENTER after completing login + PIN... ")
+        try:
+            input()
+        except EOFError:
+            await asyncio.sleep(30)
+
         url = page.url.lower()
-        
+        title = await page.title()
         if "login" in url or "sign" in title.lower():
-            print("\n[!] Still on login page. Login failed.")
+            print("  [!] Still on login page - login failed")
             return False
-        
-        await asyncio.sleep(2)
+
         await ctx.storage_state(path=str(STORAGE_FILE))
-        
         state = json.loads(STORAGE_FILE.read_text())
-        print(f"\n[OK] Session saved: {len(state.get('cookies', []))} cookies")
+        print(f"  [OK] Session saved: {len(state.get('cookies', []))} cookies")
         return True
-        
-    except EOFError:
-        print("\n[!] Non-interactive mode - waiting 30s...")
-        await asyncio.sleep(30)
-        return True
+
     except Exception as e:
-        print(f"\n[!] Login error: {e}")
+        print(f"  [!] Login error: {e}")
         return False
     finally:
         with suppress(Exception):
@@ -669,9 +546,6 @@ async def _interactive_login(browser: Browser) -> bool:
         with suppress(Exception):
             if ctx: await ctx.close()
 
-# ---------------------------------------------------------------------------
-# Scanner
-# ---------------------------------------------------------------------------
 class Scanner:
     def __init__(self):
         self.alerts:    list[Alert]      = []
@@ -681,9 +555,9 @@ class Scanner:
         atm = round(price / step) * step
         return {atm + i * step for i in range(-STRIKE_RANGE, STRIKE_RANGE + 1)}
 
-    async def sweep(self, browser: Browser) -> None:
+    async def sweep(self, browser) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
-        log.info(f"SWEEP {ts}")
+        print(f"\n{'=' * 60}\n  SWEEP  {ts}\n{'=' * 60}")
 
         for inst in INSTRUMENTS:
             ctx = page = None
@@ -692,7 +566,7 @@ class Scanner:
                 page = await ctx.new_page()
                 await self._scan_instrument(page, inst)
             except Exception as e:
-                log.warning(f"  {inst['name']}: {e}")
+                print(f"  {inst['name']}: error - {e}")
                 if "--debug" in sys.argv:
                     traceback.print_exc()
             finally:
@@ -701,59 +575,58 @@ class Scanner:
                 with suppress(Exception):
                     if ctx: await ctx.close()
 
-            await asyncio.sleep(random.uniform(1, 3))
+            await asyncio.sleep(random.uniform(1.5, 3.5))
 
-        log.info(f"Summary: watching={len(self.watchlist)}, total={len(self.alerts)}")
+        print(f"\n  Summary: watching={len(self.watchlist)}, "
+              f"broken={sum(1 for a in self.alerts if a.broken)}, "
+              f"total={len(self.alerts)}")
         self._save()
 
     async def _scan_instrument(self, page: Page, inst: dict) -> None:
+        name = inst["name"]
+
         if inst.get("is_mcx"):
             await self._scan_mcx(page, inst)
-        else:
-            await self._scan_nse(page, inst)
+            return
 
-    async def _scan_nse(self, page: Page, inst: dict) -> None:
-        name = inst["name"]
-        url  = inst["url"]
-
-        print(f"    loading ...", end="", flush=True)
-        captured = await navigate_and_capture(page, url)
-        print(f"  {len(captured)} XHR", flush=True)
+        print(f"  {name}: loading ...", end="", flush=True)
+        captured = await navigate_and_capture(page, inst["url"])
+        print(f"{len(captured)} XHR", flush=True)
 
         if not captured:
-            log.warning(f"    {name}: no XHR captured")
+            print(f"  {name}: no XHR captured")
             return
 
         price = (find_underlying_price(captured, name, inst.get("price_xhr_pattern"))
                  or await scrape_price_from_dom(page))
         if not price:
-            log.warning(f"    {name}: could not find underlying price")
+            print(f"  {name}: could not find underlying price")
             if "--debug" in sys.argv:
                 for u in sorted(captured):
-                    log.debug(f"      XHR: {u}")
+                    print(f"    XHR: {u}")
             return
-        log.info(f"    {name}: price={price:,.2f}")
+        print(f"  {name}: price={price:,.2f}")
 
         all_contracts = extract_contracts(captured, name)
-        log.info(f"    {name}: {len(all_contracts)} contracts from initial load")
+        print(f"  {name}: {len(all_contracts)} contracts")
 
         expiries = extract_expiries_from_contracts(all_contracts, name)
         if not expiries:
-            log.warning(f"    {name}: no expiry dates found in contracts")
+            print(f"  {name}: no expiry dates found")
             return
 
         expiries = expiries[: inst["n_expiries"]]
-        log.info(f"    {name}: expiries={expiries}")
+        print(f"  {name}: expiries={expiries}")
 
         for exp in expiries[1:]:
             await _human_delay(0.3, 0.8)
-            print(f"    -> {exp} ...", end="", flush=True)
+            print(f"  {name} -> {exp} ...", end="", flush=True)
             new_xhr = await capture_after_expiry_click(page, exp)
             new_c   = extract_contracts(new_xhr, name)
             all_contracts.update(new_c)
-            print(f"  +{len(new_c)}", flush=True)
+            print(f"+{len(new_c)}", flush=True)
 
-        log.info(f"    {name}: {len(all_contracts)} total contracts")
+        print(f"  {name}: {len(all_contracts)} total contracts")
 
         allowed  = self.atm_strikes(price, inst["step"])
         new_hits = 0
@@ -772,32 +645,31 @@ class Scanner:
                     checked  += 1
                     new_hits += self._process(key, name, expiry, strike, opt, ohlc)
 
-        log.info(f"    {name}: checked={checked}  new_alerts={new_hits}")
+        print(f"  {name}: checked={checked} new_alerts={new_hits}")
 
     async def _scan_mcx(self, page: Page, inst: dict) -> None:
         name = inst["name"]
 
-        print(f"    loading MCX chain ...", end="", flush=True)
+        print(f"  {name}: loading MCX chain ...", end="", flush=True)
         chain_data = await _load_mcx_chain_data(page, inst["url"])
         if not chain_data:
-            log.warning(f"    {name}: could not load option chain from page")
+            print("failed")
             return
 
         expiry           = chain_data["expiry"]
         underlying_price = chain_data.get("underlying")
 
         if not underlying_price:
-            log.warning(f"    {name}: no underlying price in chain data")
+            print("no underlying price")
             return
 
-        print(f"  price={underlying_price:,.2f}  expiry={expiry}", flush=True)
+        print(f"price={underlying_price:,.2f} expiry={expiry}", flush=True)
 
         atm_strikes = self.atm_strikes(float(underlying_price), inst["step"])
         atm_paisa   = {s * 100 for s in atm_strikes}
-        log.debug(f"    {name}: ATM strikes={sorted(atm_strikes)}")
 
         contracts = _extract_mcx_chain_prices(chain_data, atm_paisa)
-        log.info(f"    {name}: {len(contracts)} ATM contracts with data")
+        print(f"  {name}: {len(contracts)} ATM contracts")
 
         new_hits = 0
         checked  = 0
@@ -808,7 +680,7 @@ class Scanner:
             checked  += 1
             new_hits += self._process(sym, name.upper(), expiry, strike, opt, ohlc)
 
-        log.info(f"    {name}: checked={checked}  new_alerts={new_hits}")
+        print(f"  {name}: checked={checked} new_alerts={new_hits}")
 
     def _process(self, key: str, name: str, expiry: str,
                  strike: int, opt: str, ohlc: dict) -> int:
@@ -838,9 +710,9 @@ class Scanner:
             return 0
 
         cond = None
-        if o > 0 and o == h and l < h:   # O==H, doji guard: low must be below
+        if o > 0 and o == h and l < h:
             cond = "Open==High"
-        elif o > 0 and o == l and h > l: # O==L, doji guard: high must be above
+        elif o > 0 and o == l and h > l:
             cond = "Open==Low"
         if not cond:
             return 0
@@ -873,16 +745,16 @@ class Scanner:
     @staticmethod
     def _print_alert(a: Alert) -> None:
         arrow = "^" if a.condition == "Open==High" else "v"
-        log.info(f"[!] {arrow} NEW  {a.instrument} {a.strike}{a.opt_type}"
-                 f"  exp={a.expiry}  {a.condition}"
-                 f"  O={a.open:.2f}  H={a.high:.2f}  L={a.low:.2f}  LTP={a.ltp}")
+        print(f"  [!] {arrow} NEW  {a.instrument} {a.strike}{a.opt_type}"
+              f"  exp={a.expiry}  {a.condition}"
+              f"  O={a.open:.2f}  H={a.high:.2f}  L={a.low:.2f}")
 
     @staticmethod
     def _print_breakout(a: Alert, ltp: float) -> None:
         level = a.high if a.condition == "Open==High" else a.low
         side  = "HIGH ^" if a.condition == "Open==High" else "LOW v"
-        log.info(f"[!] BROKEN {side}  {a.instrument} {a.strike}{a.opt_type}"
-                 f"  exp={a.expiry}  level={level:.2f}  ltp={ltp:.2f}")
+        print(f"  [!] BROKEN {side}  {a.instrument} {a.strike}{a.opt_type}"
+              f"  exp={a.expiry}  level={level:.2f}  ltp={ltp:.2f}")
 
     def _save(self) -> None:
         payload = {
@@ -897,108 +769,49 @@ class Scanner:
                            encoding="utf-8")
             tmp.replace(ALERT_FILE)
         except Exception as e:
-            log.error(f"could not save alerts: {e}")
+            print(f"  ! could not save alerts: {e}")
 
-# ---------------------------------------------------------------------------
-# Main run loop - single browser, multiple tabs
-# ---------------------------------------------------------------------------
-async def _run_loop(once: bool) -> None:
-    scanner = Scanner()
+async def main():
+    print("\n" + "=" * 60)
+    print("  Groww Open==High / Open==Low Alert Scanner")
+    print("=" * 60)
+
+    once = "--once" in sys.argv
 
     async with async_playwright() as pw:
-        # Launch browser
-        log.info("launching browser...")
         browser = await pw.chromium.launch(
             headless=False,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
+            args=["--disable-blink-features=AutomationControlled",
+                  "--no-sandbox", "--disable-dev-shm-usage"],
         )
-        
-        # Create context with storage
-        vp_w, vp_h = random.choice(_VIEWPORTS)
-        ctx = await browser.new_context(
-            storage_state=str(STORAGE_FILE) if STORAGE_FILE.exists() else None,
-            user_agent=_random_ua(),
-            viewport={"width": vp_w, "height": vp_h},
-            screen={"width": vp_w, "height": vp_h},
-            locale="en-IN",
-            timezone_id="Asia/Kolkata",
-        )
-        
-        # Apply stealth patches
-        await ctx.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-            Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
-            Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
-            Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
-            window.chrome = {runtime: {}, loadTimes: {}, csi: {}};
-            Permissions.prototype.query = x => Promise.resolve({state: 'granted'});
-        """)
-        
-        log.info("browser ready")
 
-        # Open tabs for each instrument
-        pages = []
-        for inst in INSTRUMENTS:
-            p = await ctx.new_page()
-            await p.goto(inst["url"], wait_until="domcontentloaded", timeout=30_000)
-            await asyncio.sleep(3)
-            pages.append((inst, p))
-            log.info(f"  opened tab: {inst['name']}")
+        session_valid = False
+        if STORAGE_FILE.exists():
+            print("\n  Checking existing session...")
+            session_valid = await _check_session_valid(browser)
+        else:
+            print("\n  No session file found.")
 
-        log.info(f"{len(pages)} tabs ready")
+        if not session_valid:
+            if not await _interactive_login(browser):
+                print("\n  Login failed!")
+                await browser.close()
+                return
+        else:
+            print("\n  Using saved session.")
 
-        if not once:
-            log.info(f"continuous mode  interval={SCAN_INTERVAL}s")
+        scanner = Scanner()
 
-        try:
+        if once:
+            await scanner.sweep(browser)
+        else:
+            print(f"\n  Continuous mode (interval={SCAN_INTERVAL}s, Ctrl+C to stop)\n")
             while True:
-                ts = datetime.now().strftime("%H:%M:%S")
-                log.info(f"SWEEP {ts}")
-
-                for inst, page in pages:
-                    name = inst["name"]
-                    log.info(f"> {name}")
-                    
-                    # Reload to get fresh data
-                    await page.reload(wait_until="domcontentloaded", timeout=30_000)
-                    await asyncio.sleep(PAGE_SETTLE)
-                    
-                    try:
-                        await scanner._scan_instrument(page, inst)
-                    except Exception as e:
-                        log.warning(f"  {name}: {e}")
-                        if "--debug" in sys.argv:
-                            traceback.print_exc()
-
-                log.info(f"Summary: watching={len(scanner.watchlist)}, total={len(scanner.alerts)}")
-                scanner._save()
-
-                if once:
-                    break
+                await scanner.sweep(browser)
                 await asyncio.sleep(SCAN_INTERVAL)
 
-        except KeyboardInterrupt:
-            log.info("interrupted by user")
-        finally:
-            # Save session
-            with suppress(Exception):
-                await ctx.storage_state(path=str(STORAGE_FILE))
-            with suppress(Exception):
-                await ctx.close()
-            with suppress(Exception):
-                await browser.close()
-            log.info("done")
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-def main():
-    once = "--once" in sys.argv
-    try:
-        asyncio.run(_run_loop(once))
-    except KeyboardInterrupt:
-        pass
+        await browser.close()
+        print("\n  Done!")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
