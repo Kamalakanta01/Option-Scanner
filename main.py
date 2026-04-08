@@ -6,26 +6,76 @@ Single entry point - handles login + scanning automatically.
 
 import asyncio
 import json
+import logging
+import os
 import random
 import re
 import sys
 import traceback
 import urllib.request
 import urllib.error
+from logging.handlers import RotatingFileHandler
 from urllib import parse as urllib_parse
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
 from typing import Optional
 
 from playwright.async_api import async_playwright, BrowserContext, Page
 
-TELEGRAM_BOT_TOKEN = "8003139162:AAHJOyWOzNRuNxhMLaulF6XBcXeXjyAP33g"  # Your bot token from @BotFather
-TELEGRAM_CHAT_ID   = "-4926416519"  # Your chat ID from @userinfobot
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8003139162:AAHJOyWOzNRuNxhMLaulF6XBcXeXjyAP33g")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "-4926416519")
+
+STORAGE_FILE  = Path("groww_state.json")
+ALERT_FILE    = Path("alerts.json")
+LOG_FILE      = Path("scanner.log")
+SCAN_INTERVAL = 90
+STRIKE_RANGE  = 12
+PAGE_SETTLE   = 6.0
+EXPIRY_SETTLE = 3.5
+HEARTBEAT_EVERY = 40
+
+log = logging.getLogger(__name__)
+
+IST_TZ = None
+
+def _init_tz():
+    global IST_TZ
+    try:
+        from zoneinfo import ZoneInfo
+        IST_TZ = ZoneInfo("Asia/Kolkata")
+    except ImportError:
+        import pytz
+        IST_TZ = pytz.timezone("Asia/Kolkata")
+
+_init_tz()
+
+def _setup_logging() -> None:
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+    file_handler = RotatingFileHandler(
+        LOG_FILE, maxBytes=5_000_000, backupCount=5, encoding="utf-8"
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s  %(levelname)-8s %(message)s",
+                          datefmt="%Y-%m-%d %H:%M:%S")
+    )
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setLevel(logging.INFO)
+    stream_handler.setFormatter(
+        logging.Formatter("%(asctime)s  %(levelname)-8s %(message)s",
+                          datefmt="%Y-%m-%d %H:%M:%S")
+    )
+    root.addHandler(file_handler)
+    root.addHandler(stream_handler)
 
 def _send_telegram(message: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.debug("Telegram: no token/chat_id configured")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     data = urllib_parse.urlencode({
@@ -38,16 +88,9 @@ def _send_telegram(message: str) -> bool:
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.status == 200
-    except Exception:
+    except Exception as e:
+        log.warning("Telegram send failed: %s", e)
         return False
-
-STORAGE_FILE  = Path("groww_state.json")
-ALERT_FILE    = Path("alerts.json")
-LOG_FILE      = Path("scanner.log")
-SCAN_INTERVAL = 90
-STRIKE_RANGE  = 12
-PAGE_SETTLE   = 6.0
-EXPIRY_SETTLE = 3.5
 
 INSTRUMENTS = [
     dict(name="NIFTY",    step=50,  n_expiries=2,
@@ -96,6 +139,7 @@ class Alert:
     open:       float
     high:       float
     low:        float
+    xhr_key:    str = ""
     ltp:        Optional[float] = None
     seen_at:    str = field(default_factory=lambda: datetime.now().isoformat())
     broken:     bool = False
@@ -279,6 +323,80 @@ async def scrape_price_from_dom(page: Page) -> Optional[float]:
     except Exception:
         return None
 
+async def scrape_option_chain_from_dom(page: Page) -> dict:
+    try:
+        result = await page.evaluate("""() => {
+            const script = document.querySelector('#__NEXT_DATA__');
+            if (!script) return {contracts: {}, error: 'No __NEXT_DATA__ found'};
+            
+            const data = JSON.parse(script.textContent);
+            const pageProps = data.props?.pageProps;
+            if (!pageProps) return {contracts: {}, error: 'No pageProps'};
+            
+            const optionChain = pageProps.data?.optionChain;
+            if (!optionChain) return {contracts: {}, error: 'No optionChain in pageProps'};
+            
+            const contracts = {};
+            const optionContracts = optionChain.optionContracts || [];
+            
+            optionContracts.forEach(item => {
+                const strikePrice = item.strikePrice;
+                const strike = strikePrice / 100;
+                
+                if (item.ce) {
+                    contracts[item.ce.growwContractId] = {
+                        strike,
+                        opt: 'CE',
+                        growwId: item.ce.growwContractId,
+                        close: item.ce.liveData?.close,
+                        ltp: item.ce.liveData?.ltp
+                    };
+                }
+                
+                if (item.pe) {
+                    contracts[item.pe.growwContractId] = {
+                        strike,
+                        opt: 'PE',
+                        growwId: item.pe.growwContractId,
+                        close: item.pe.liveData?.close,
+                        ltp: item.pe.liveData?.ltp
+                    };
+                }
+            });
+            
+            return {
+                contracts,
+                contractCount: Object.keys(contracts).length,
+                expiry: optionChain.expiryDetailsDto?.currentExpiry,
+                strikeCount: optionContracts.length
+            };
+        }""")
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+async def expand_option_chain(page: Page) -> int:
+    try:
+        result = await page.evaluate("""() => {
+            const container = document.querySelector('[class*="SplitScrollTable"]');
+            if (!container) return {scrolled: 0, height: 0};
+            
+            const total = container.scrollHeight;
+            let scrolled = 0;
+            
+            for (let pos = 0; pos <= total; pos += 200) {
+                container.scrollTop = pos;
+                scrolled++;
+            }
+            
+            container.scrollTop = 0;
+            
+            return {scrolled, height: total};
+        }""")
+        return result.get("scrolled", 0)
+    except Exception:
+        return 0
+
 def extract_contracts(captured: dict, name: str) -> dict:
     result = {}
     for data in captured.values():
@@ -421,7 +539,11 @@ async def navigate_and_capture(page: Page, url: str,
     async def _on_response(resp):
         try:
             if resp.status == 200 and any(p in resp.url for p in CAPTURE_PATTERNS):
-                captured[resp.url] = await resp.json()
+                data = await resp.json()
+                if resp.url in captured:
+                    captured[resp.url].update(data)
+                else:
+                    captured[resp.url] = data
         except Exception:
             pass
 
@@ -429,10 +551,33 @@ async def navigate_and_capture(page: Page, url: str,
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
     except Exception as e:
-        print(f"    ! goto error: {e}")
+        log.warning("goto error: %s", e)
+    
     await asyncio.sleep(settle)
+    
+    await _scroll_option_chain(page, captured)
+    
     page.remove_listener("response", _on_response)
     return captured
+
+async def _scroll_option_chain(page: Page, captured: dict) -> None:
+    try:
+        await page.evaluate("""() => {
+            const container = document.querySelector('[class*="SplitScrollTable"]');
+            if (!container) return;
+            
+            const total = container.scrollHeight;
+            const step = Math.max(100, total / 100);
+            
+            for (let pos = 0; pos <= total; pos += step) {
+                container.scrollTop = pos;
+            }
+            
+            container.scrollTop = 0;
+        }""")
+        await asyncio.sleep(4)
+    except Exception:
+        pass
 
 async def _click_expiry_in_dom(page: Page, expiry_date: str) -> bool:
     try:
@@ -496,6 +641,20 @@ async def capture_after_expiry_click(page: Page, expiry_date: str,
     page.remove_listener("response", _on_response)
     return new_xhr
 
+def _is_market_open_equity() -> bool:
+    now = datetime.now(IST_TZ)
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    return time(9, 14) <= t <= time(15, 31)
+
+def _is_market_open_mcx() -> bool:
+    now = datetime.now(IST_TZ)
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    return time(9, 14) <= t <= time(23, 31)
+
 async def _check_session_valid(browser) -> bool:
     ctx = page = None
     try:
@@ -507,12 +666,12 @@ async def _check_session_valid(browser) -> bool:
         title = await page.title()
         url = page.url.lower()
         if "login" in url or "login" in title.lower() or "sign" in title.lower():
-            print("  session invalid (login page)")
+            log.info("Session invalid (login page detected)")
             return False
-        print(f"  session valid")
+        log.info("Session valid")
         return True
     except Exception as e:
-        print(f"  session check error: {e}")
+        log.warning("Session check error: %s", e)
         return False
     finally:
         with suppress(Exception):
@@ -520,54 +679,14 @@ async def _check_session_valid(browser) -> bool:
         with suppress(Exception):
             if ctx: await ctx.close()
 
-async def _interactive_login(browser) -> bool:
-    print("\n" + "=" * 60)
-    print("  LOGIN REQUIRED")
-    print("=" * 60)
-    print("""
-  1. Browser will open groww.in
-  2. Login with email/password
-  3. Complete PIN verification if asked
-  4. Wait for page to fully load
-  5. Press ENTER here when done
-""")
-
-    ctx = page = None
-    try:
-        ctx = await browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            locale="en-IN",
-            timezone_id="Asia/Kolkata",
-        )
-        page = await ctx.new_page()
-        await page.goto("https://groww.in/login",
-                        wait_until="domcontentloaded", timeout=30_000)
-
-        print("  Press ENTER after completing login + PIN... ")
-        try:
-            input()
-        except EOFError:
-            await asyncio.sleep(30)
-
-        url = page.url.lower()
-        title = await page.title()
-        if "login" in url or "sign" in title.lower():
-            print("  [!] Still on login page - login failed")
-            return False
-
-        await ctx.storage_state(path=str(STORAGE_FILE))
-        state = json.loads(STORAGE_FILE.read_text())
-        print(f"  [OK] Session saved: {len(state.get('cookies', []))} cookies")
-        return True
-
-    except Exception as e:
-        print(f"  [!] Login error: {e}")
-        return False
-    finally:
-        with suppress(Exception):
-            if page: await page.close()
-        with suppress(Exception):
-            if ctx: await ctx.close()
+async def _handle_session_expired() -> bool:
+    _send_telegram(
+        "⚠️ Groww session expired. Open groww.in, login, save cookies, "
+        "then restart scanner."
+    )
+    log.warning("Session expired — waiting 10 min before retry")
+    await asyncio.sleep(600)
+    return True
 
 class Scanner:
     def __init__(self):
@@ -575,25 +694,66 @@ class Scanner:
         self.watchlist: dict[str, Alert] = {}
         self._new_alerts_batch: list[Alert] = []
         self._broken_alerts_batch: list[Alert] = []
+        self._sweep_count = 0
+        self._last_sweep_time: Optional[datetime] = None
+        self._load()
+
+    def _load(self) -> None:
+        if not ALERT_FILE.exists():
+            log.info("No alerts file found — starting fresh")
+            return
+        try:
+            data = json.loads(ALERT_FILE.read_text(encoding="utf-8"))
+            for d in data.get("alerts", []):
+                if d.get("broken"):
+                    continue
+                try:
+                    a = Alert(**d)
+                except Exception:
+                    continue
+                xk = d.get("xhr_key", d.get("symbol", ""))
+                if xk:
+                    self.watchlist[xk] = a
+                    self.alerts.append(a)
+            log.info(
+                "Loaded %d alerts from %s (watching=%d)",
+                len(self.alerts), ALERT_FILE, len(self.watchlist)
+            )
+        except Exception as e:
+            log.warning("Could not load alerts: %s", e)
 
     def atm_strikes(self, price: float, step: int) -> set[int]:
         atm = round(price / step) * step
         return {atm + i * step for i in range(-STRIKE_RANGE, STRIKE_RANGE + 1)}
 
     async def sweep(self, browser) -> None:
+        self._sweep_count += 1
         ts = datetime.now().strftime("%H:%M:%S")
-        print(f"\n{'=' * 60}\n  SWEEP  {ts}\n{'=' * 60}")
+        log.info("=" * 56)
+        log.info("SWEEP  #%d  %s", self._sweep_count, ts)
+        log.info("=" * 56)
         self._new_alerts_batch.clear()
         self._broken_alerts_batch.clear()
 
+        equity_open  = _is_market_open_equity()
+        mcx_open     = _is_market_open_mcx()
+        log.debug("Market status — equity=%s, mcx=%s", equity_open, mcx_open)
+
         for inst in INSTRUMENTS:
+            if inst["is_mcx"] and not mcx_open:
+                log.debug("Skipping %s (MCX closed)", inst["name"])
+                continue
+            if not inst["is_mcx"] and not equity_open:
+                log.debug("Skipping %s (equity closed)", inst["name"])
+                continue
+
             ctx = page = None
             try:
                 ctx = await _make_context(browser)
                 page = await ctx.new_page()
                 await self._scan_instrument(page, inst)
             except Exception as e:
-                print(f"  {inst['name']}: error - {e}")
+                log.error("%s: error — %s", inst["name"], e)
                 if "--debug" in sys.argv:
                     traceback.print_exc()
             finally:
@@ -604,11 +764,29 @@ class Scanner:
 
             await asyncio.sleep(random.uniform(1.5, 3.5))
 
-        print(f"\n  Summary: watching={len(self.watchlist)}, "
-              f"broken={sum(1 for a in self.alerts if a.broken)}, "
-              f"total={len(self.alerts)}")
+        self._last_sweep_time = datetime.now()
+        log.info(
+            "Summary: watching=%d, broken=%d, total=%d",
+            len(self.watchlist),
+            sum(1 for a in self.alerts if a.broken),
+            len(self.alerts),
+        )
         self._send_batch_telegram()
         self._save()
+        self._heartbeat()
+
+    def _heartbeat(self) -> None:
+        if self._sweep_count % HEARTBEAT_EVERY == 0:
+            ts = (
+                self._last_sweep_time.strftime("%H:%M")
+                if self._last_sweep_time else "N/A"
+            )
+            msg = (
+                f"🟢 alive | watching={len(self.watchlist)} "
+                f"| sweeps={self._sweep_count} | last={ts}"
+            )
+            log.info("HEARTBEAT: %s", msg)
+            _send_telegram(msg)
 
     async def _scan_instrument(self, page: Page, inst: dict) -> None:
         name = inst["name"]
@@ -617,44 +795,77 @@ class Scanner:
             await self._scan_mcx(page, inst)
             return
 
-        print(f"  {name}: loading ...", end="", flush=True)
+        log.info("%s: loading ...", name)
         captured = await navigate_and_capture(page, inst["url"])
-        print(f"{len(captured)} XHR", flush=True)
+        log.info("%s: captured %d XHR responses", name, len(captured))
 
         if not captured:
-            print(f"  {name}: no XHR captured")
+            log.info("%s: no XHR captured", name)
             return
 
         price = (find_underlying_price(captured, name, inst.get("price_xhr_pattern"))
                  or await scrape_price_from_dom(page))
         if not price:
-            print(f"  {name}: could not find underlying price")
+            log.info("%s: could not find underlying price", name)
             if "--debug" in sys.argv:
                 for u in sorted(captured):
-                    print(f"    XHR: {u}")
+                    log.debug("  XHR: %s", u)
             return
-        print(f"  {name}: price={price:,.2f}")
+        log.info("%s: price=%s", name, f"{price:,.2f}")
 
         all_contracts = extract_contracts(captured, name)
-        print(f"  {name}: {len(all_contracts)} contracts")
+        xhr_count = len(all_contracts)
+        log.info("%s: %d contracts from XHR", name, xhr_count)
 
         expiries = extract_expiries_from_contracts(all_contracts, name)
         if not expiries:
-            print(f"  {name}: no expiry dates found")
+            log.info("%s: no expiry dates found", name)
             return
 
         expiries = expiries[: inst["n_expiries"]]
-        print(f"  {name}: expiries={expiries}")
+        log.info("%s: expiries=%s", name, expiries)
 
         for exp in expiries[1:]:
             await _human_delay(0.3, 0.8)
-            print(f"  {name} -> {exp} ...", end="", flush=True)
+            log.info("%s -> %s ...", name, exp)
             new_xhr = await capture_after_expiry_click(page, exp)
             new_c   = extract_contracts(new_xhr, name)
             all_contracts.update(new_c)
-            print(f"+{len(new_c)}", flush=True)
+            log.info("%s -> %s: +%d contracts", name, exp, len(new_c))
 
-        print(f"  {name}: {len(all_contracts)} total contracts")
+        log.info("%s: %d contracts before DOM scrape", name, len(all_contracts))
+
+        await _human_delay(0.5, 1.0)
+        expanded = await expand_option_chain(page)
+        if expanded > 0:
+            log.info("%s: expanded (clicked %d buttons)", name, expanded)
+
+        dom_data = await scrape_option_chain_from_dom(page)
+        dom_expiry = dom_data.get("expiry")
+        if dom_expiry:
+            expiries = [dom_expiry] + [e for e in expiries if e != dom_expiry][:inst["n_expiries"]-1]
+            log.info("%s: DOM expiry=%s", name, dom_expiry)
+        
+        dom_contracts = dom_data.get("contracts", {})
+        dom_strike_count = dom_data.get("strikeCount", 0)
+        log.info("%s: %d strikes from DOM", name, dom_strike_count)
+        
+        dom_count = 0
+        for groww_id, dom_val in dom_contracts.items():
+            if groww_id not in all_contracts:
+                all_contracts[groww_id] = {
+                    "open": None,
+                    "high": None,
+                    "low": None,
+                    "ltp": dom_val.get("ltp"),
+                    "close": dom_val.get("close"),
+                }
+                dom_count += 1
+        
+        if dom_count > 0:
+            log.info("%s: +%d contracts from DOM", name, dom_count)
+
+        log.info("%s: %d total contracts", name, len(all_contracts))
 
         allowed  = self.atm_strikes(price, inst["step"])
         new_hits = 0
@@ -673,31 +884,34 @@ class Scanner:
                     checked  += 1
                     new_hits += self._process(key, name, expiry, strike, opt, ohlc)
 
-        print(f"  {name}: checked={checked} new_alerts={new_hits}")
+        log.info("%s: checked=%d new_alerts=%d", name, checked, new_hits)
 
     async def _scan_mcx(self, page: Page, inst: dict) -> None:
         name = inst["name"]
 
-        print(f"  {name}: loading MCX chain ...", end="", flush=True)
+        log.info("%s: loading MCX chain ...", name)
         chain_data = await _load_mcx_chain_data(page, inst["url"])
         if not chain_data:
-            print("failed")
+            log.info("%s: MCX chain load failed", name)
             return
 
         expiry           = chain_data["expiry"]
         underlying_price = chain_data.get("underlying")
 
         if not underlying_price:
-            print("no underlying price")
+            log.info("%s: no underlying price", name)
             return
 
-        print(f"price={underlying_price:,.2f} expiry={expiry}", flush=True)
+        log.info(
+            "%s: price=%s expiry=%s",
+            name, f"{underlying_price:,.2f}", expiry
+        )
 
         atm_strikes = self.atm_strikes(float(underlying_price), inst["step"])
         atm_paisa   = {s * 100 for s in atm_strikes}
 
         contracts = _extract_mcx_chain_prices(chain_data, atm_paisa)
-        print(f"  {name}: {len(contracts)} ATM contracts")
+        log.info("%s: %d ATM contracts", name, len(contracts))
 
         new_hits = 0
         checked  = 0
@@ -708,7 +922,7 @@ class Scanner:
             checked  += 1
             new_hits += self._process(sym, name.upper(), expiry, strike, opt, ohlc)
 
-        print(f"  {name}: checked={checked} new_alerts={new_hits}")
+        log.info("%s: checked=%d new_alerts=%d", name, checked, new_hits)
 
     def _process(self, key: str, name: str, expiry: str,
                  strike: int, opt: str, ohlc: dict) -> int:
@@ -729,24 +943,25 @@ class Scanner:
             if ltp is not None:
                 try:
                     ltp_f = float(ltp)
-                    if cond == "Open==High" and ltp_f > h:
+                    if cond == "Open==High" and ltp_f > h + 0.001:
                         self._mark_broken(key, ltp_f)
-                    elif cond == "Open==Low" and ltp_f < l:
+                    elif cond == "Open==Low" and ltp_f < l - 0.001:
                         self._mark_broken(key, ltp_f)
                 except (TypeError, ValueError):
                     pass
             return 0
 
         cond = None
-        if o > 0 and o == h and l < h:
+        if o > 0 and abs(o - h) <= 0.001 and l < h:
             cond = "Open==High"
-        elif o > 0 and o == l and h > l:
+        elif o > 0 and abs(o - l) <= 0.001 and h > l:
             cond = "Open==Low"
         if not cond:
             return 0
 
         alert = Alert(
             symbol     = f"{name}{expiry}{strike}{opt}"[:50],
+            xhr_key    = key,
             instrument = name,
             expiry     = expiry,
             strike     = strike,
@@ -758,7 +973,7 @@ class Scanner:
             ltp        = float(ltp) if ltp is not None else None,
         )
         self.alerts.append(alert)
-        self.watchlist[key] = alert
+        self.watchlist[alert.xhr_key] = alert
         self._new_alerts_batch.append(alert)
         self._print_alert(alert)
         return 1
@@ -775,16 +990,21 @@ class Scanner:
     @staticmethod
     def _print_alert(a: Alert) -> None:
         arrow = "^" if a.condition == "Open==High" else "v"
-        print(f"  [!] {arrow} NEW  {a.instrument} {a.strike}{a.opt_type}"
-              f"  exp={a.expiry}  {a.condition}"
-              f"  O={a.open:.2f}  H={a.high:.2f}  L={a.low:.2f}")
+        log.info(
+            "[!] %s NEW  %s %s%s  exp=%s  %s  O=%.2f  H=%.2f  L=%.2f",
+            arrow, a.instrument, a.strike, a.opt_type,
+            a.expiry, a.condition, a.open, a.high, a.low
+        )
 
     @staticmethod
     def _print_breakout(a: Alert, ltp: float) -> None:
         level = a.high if a.condition == "Open==High" else a.low
         side  = "HIGH ^" if a.condition == "Open==High" else "LOW v"
-        print(f"  [!] BROKEN {side}  {a.instrument} {a.strike}{a.opt_type}"
-              f"  exp={a.expiry}  level={level:.2f}  ltp={ltp:.2f}")
+        log.info(
+            "[!] BROKEN %s  %s %s%s  exp=%s  level=%.2f  ltp=%.2f",
+            side, a.instrument, a.strike, a.opt_type,
+            a.expiry, level, ltp
+        )
 
     def _send_batch_telegram(self) -> None:
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -801,8 +1021,10 @@ class Scanner:
                 lines.append("")
             lines.append("💥 <b>BROKEN ALERTS</b>")
             for a in self._broken_alerts_batch:
-                level = a.high if a.condition == "Open==High" else a.low
-                lines.append(f"{a.instrument} {a.strike}{a.opt_type} | {a.condition} | LTP={a.ltp:.2f}")
+                lines.append(
+                    f"{a.instrument} {a.strike}{a.opt_type} | "
+                    f"{a.condition} | LTP={a.ltp:.2f}"
+                )
         
         if lines:
             ts = datetime.now().strftime("%H:%M")
@@ -822,49 +1044,176 @@ class Scanner:
                            encoding="utf-8")
             tmp.replace(ALERT_FILE)
         except Exception as e:
-            print(f"  ! could not save alerts: {e}")
+            log.error("Could not save alerts: %s", e)
 
-async def main():
-    print("\n" + "=" * 60)
-    print("  Groww Open==High / Open==Low Alert Scanner")
-    print("=" * 60)
 
-    once = "--once" in sys.argv
-
+async def _run_loop(once: bool = False, headless: bool = True):
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
-            headless=False,
+            headless=headless,
             args=["--disable-blink-features=AutomationControlled",
                   "--no-sandbox", "--disable-dev-shm-usage"],
         )
 
         session_valid = False
         if STORAGE_FILE.exists():
-            print("\n  Checking existing session...")
+            log.info("Checking existing session ...")
             session_valid = await _check_session_valid(browser)
         else:
-            print("\n  No session file found.")
+            log.info("No session file found.")
 
         if not session_valid:
             if not await _interactive_login(browser):
-                print("\n  Login failed!")
+                log.error("Login failed!")
                 await browser.close()
                 return
-        else:
-            print("\n  Using saved session.")
 
         scanner = Scanner()
 
         if once:
             await scanner.sweep(browser)
         else:
-            print(f"\n  Continuous mode (interval={SCAN_INTERVAL}s, Ctrl+C to stop)\n")
+            log.info(
+                "Continuous mode (interval=%ds, Ctrl+C to stop)", SCAN_INTERVAL
+            )
             while True:
                 await scanner.sweep(browser)
                 await asyncio.sleep(SCAN_INTERVAL)
 
         await browser.close()
-        print("\n  Done!")
+        log.info("Done!")
+
+
+async def _interactive_login(browser) -> bool:
+    log.info("=" * 56)
+    log.info("LOGIN REQUIRED")
+    log.info("=" * 56)
+    log.info(
+        "1. Browser will open groww.in\n"
+        "2. Login with email/password\n"
+        "3. Complete PIN verification if asked\n"
+        "4. Wait for page to fully load\n"
+        "5. Press ENTER here when done"
+    )
+
+    ctx = page = None
+    try:
+        ctx = await browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            locale="en-IN",
+            timezone_id="Asia/Kolkata",
+        )
+        page = await ctx.new_page()
+        await page.goto("https://groww.in/login",
+                        wait_until="domcontentloaded", timeout=30_000)
+
+        log.info("Press ENTER after completing login + PIN ... ")
+        try:
+            input()
+        except EOFError:
+            await asyncio.sleep(30)
+
+        url = page.url.lower()
+        title = await page.title()
+        if "login" in url or "sign" in title.lower():
+            log.error("Still on login page — login failed")
+            return False
+
+        await ctx.storage_state(path=str(STORAGE_FILE))
+        state = json.loads(STORAGE_FILE.read_text())
+        log.info("Session saved: %d cookies", len(state.get("cookies", [])))
+        return True
+
+    except Exception as e:
+        log.error("Login error: %s", e)
+        return False
+    finally:
+        with suppress(Exception):
+            if page: await page.close()
+        with suppress(Exception):
+            if ctx: await ctx.close()
+
+
+async def main():
+    _setup_logging()
+    log.info("=" * 56)
+    log.info("Groww Open==High / Open==Low Alert Scanner")
+    log.info("=" * 56)
+
+    once     = "--once" in sys.argv
+    headless = "--visible" not in sys.argv
+
+    if not headless:
+        log.info("VISIBLE mode (pass --visible to enable window)")
+
+    browser_crashes = 0
+    sweep_crashes   = 0
+
+    while True:
+        try:
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(
+                    headless=headless,
+                    args=["--disable-blink-features=AutomationControlled",
+                          "--no-sandbox", "--disable-dev-shm-usage"],
+                )
+
+                session_valid = False
+                if STORAGE_FILE.exists():
+                    log.info("Checking existing session ...")
+                    session_valid = await _check_session_valid(browser)
+                else:
+                    log.info("No session file found.")
+
+                if not session_valid:
+                    if not await _handle_session_expired():
+                        await browser.close()
+                        continue
+                    if not await _interactive_login(browser):
+                        log.error("Login failed!")
+                        await browser.close()
+                        continue
+
+                scanner = Scanner()
+
+                if once:
+                    await scanner.sweep(browser)
+                    await browser.close()
+                    log.info("Done!")
+                    break
+
+                log.info(
+                    "Continuous mode (interval=%ds, Ctrl+C to stop)", SCAN_INTERVAL
+                )
+                while True:
+                    try:
+                        await scanner.sweep(browser)
+                        await asyncio.sleep(SCAN_INTERVAL)
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception as e:
+                        sweep_crashes += 1
+                        log.error("Sweep-level crash (#%d): %s", sweep_crashes, e,
+                                  exc_info=True)
+                        _send_telegram(
+                            f"⚠️ Scanner sweep crashed ({sweep_crashes}): {e}\n"
+                            f"Resuming in {SCAN_INTERVAL}s"
+                        )
+                        await asyncio.sleep(SCAN_INTERVAL)
+
+        except KeyboardInterrupt:
+            log.info("Interrupted — shutting down gracefully")
+            break
+        except Exception as e:
+            browser_crashes += 1
+            log.error("Browser-level crash (#%d): %s", browser_crashes, e,
+                      exc_info=True)
+            _send_telegram(
+                f"⚠️ Browser crashed ({browser_crashes}): {e}\n"
+                f"Restarting in 30s"
+            )
+            await asyncio.sleep(30)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

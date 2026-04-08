@@ -28,7 +28,11 @@ from main import (
     _extract_mcx_chain_prices,
     _sf,
     STORAGE_FILE,
+    _run_loop,
 )
+
+def _is_equal(a, b, tol=0.001):
+    return abs(a - b) <= tol
 
 PASS = "[PASS]"
 FAIL = "[FAIL]"
@@ -116,7 +120,7 @@ check("O==H contract present", "NIFTY2604722500CE" in contracts, True)
 c = contracts.get("NIFTY2604722500CE", {})
 o, h, l = c.get("open"), c.get("high"), c.get("low")
 cond = None
-if o and o > 0 and o == h and l is not None and l < h:
+if o and o > 0 and _is_equal(o, h) and l is not None and l < h:
     cond = "Open==High"
 check("O==H detected correctly", cond, "Open==High")
 
@@ -124,7 +128,7 @@ check("O==H detected correctly", cond, "Open==High")
 c2 = contracts.get("NIFTY2604722500PE", {})
 o2, h2, l2 = c2.get("open"), c2.get("high"), c2.get("low")
 cond2 = None
-if o2 and o2 > 0 and o2 == l2 and h2 is not None and h2 > l2:
+if o2 and o2 > 0 and _is_equal(o2, l2) and h2 is not None and h2 > l2:
     cond2 = "Open==Low"
 check("O==L detected correctly", cond2, "Open==Low")
 
@@ -132,7 +136,7 @@ check("O==L detected correctly", cond2, "Open==Low")
 doji = {"open": 100.0, "high": 100.0, "low": 100.0, "ltp": 100.0}
 o3, h3, l3 = doji["open"], doji["high"], doji["low"]
 cond3 = None
-if o3 > 0 and o3 == h3 and l3 < h3:
+if o3 > 0 and _is_equal(o3, h3) and l3 < h3:
     cond3 = "Open==High"
 check("doji (O==H==L) not flagged as O==H", cond3, None)
 
@@ -183,7 +187,7 @@ key_ce = [k for k in mcx_c if "94000" in k and "CE" in k]
 if key_ce:
     mc = mcx_c[key_ce[0]]
     cond_mcx = None
-    if mc["open"] == mc["high"] and mc["low"] < mc["high"]:
+    if _is_equal(mc["open"], mc["high"]) and mc["low"] < mc["high"]:
         cond_mcx = "Open==High"
     check("MCX O==H call detected", cond_mcx, "Open==High")
 # O==L on put at 93500
@@ -191,7 +195,7 @@ key_pe = [k for k in mcx_c if "93500" in k and "PE" in k]
 if key_pe:
     mp = mcx_c[key_pe[0]]
     cond_mp = None
-    if mp["open"] == mp["low"] and mp["high"] > mp["low"]:
+    if _is_equal(mp["open"], mp["low"]) and mp["high"] > mp["low"]:
         cond_mp = "Open==Low"
     check("MCX O==L put detected", cond_mp, "Open==Low")
 
@@ -238,10 +242,8 @@ print("  LIVE SWEEP  (--live flag detected)")
 print("="*60)
 print("  Launching browser + running one sweep. Check scanner.log for detail.\n")
 
-# Reset argv for main's own logic
 sys.argv = [sys.argv[0], "--once", "--debug"]
 
-from main import _run_loop
 try:
     asyncio.run(_run_loop(once=True))
 except KeyboardInterrupt:
